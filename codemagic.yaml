@@ -1,0 +1,121 @@
+# Codemagic CI/CD 配置
+# 文档：https://docs.codemagic.io/yaml-quick-start/building-a-native-ios-app/
+#
+# 工程由 xcodegen 从 project.yml 生成，所以每个 workflow 都先跑 xcodegen generate。
+# 签名材料（App Store Connect API Key、分发证书、描述文件）只放在 Codemagic UI，
+# 不写进仓库；App 里用户自填的模型 API Key 与 CI 无关。
+
+workflows:
+  # 日常校验：不签名编译 + 共享逻辑回归，任何分支 push / PR 都跑
+  ios-build:
+    name: iOS Build (unsigned) & Shared Checks
+    instance_type: mac_mini_m2
+    max_build_duration: 60
+    triggering:
+      events:
+        - push
+        - pull_request
+      branch_patterns:
+        - pattern: "*"
+          include: true
+          source: true
+      cancel_previous_builds: true
+    environment:
+      xcode: latest
+      vars:
+        XCODE_PROJECT: "JevJarvis.xcodeproj"
+        XCODE_SCHEME: "JevJarvis"
+    scripts:
+      - name: Generate Xcode project (xcodegen)
+        script: |
+          set -e
+          command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodegen generate
+      - name: Shared prompt/behavior regression checks
+        script: |
+          set -e
+          swiftc -o /tmp/jevcheck tools/PromptCheck/main.swift Shared/*.swift
+          /tmp/jevcheck
+      - name: Build unsigned device binary
+        script: |
+          set -e
+          xcodebuild -project "$XCODE_PROJECT" \
+            -scheme "$XCODE_SCHEME" \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+    artifacts:
+      - /tmp/xcodebuild_logs/*.log
+
+  # 发版：打 v* tag（或手动启动）→ 签名 → 上传 TestFlight
+  ios-testflight:
+    name: iOS Release -> TestFlight
+    instance_type: mac_mini_m2
+    max_build_duration: 90
+    integrations:
+      # 必须与 Codemagic Team settings > Developer Portal 里 API Key 的名字一致
+      app_store_connect: jev_appstore_key
+    triggering:
+      events:
+        - tag
+      tag_patterns:
+        - pattern: "v*"
+          include: true
+    environment:
+      xcode: latest
+      # App Store 分发：Codemagic 会按 bundle id 自动凑齐主 App + .keyboard + .live 的描述文件
+      ios_signing:
+        distribution_type: app_store
+        bundle_identifier: com.jevchat.jarvis
+      vars:
+        XCODE_PROJECT: "JevJarvis.xcodeproj"
+        XCODE_SCHEME: "JevJarvis"
+        BUNDLE_ID: "com.jevchat.jarvis"
+        # App Store Connect > App Information > Apple ID（纯数字），用于自动递增 build number。
+        # 没填时保持 project.yml 里的 CURRENT_PROJECT_VERSION，不做自增。
+        APP_STORE_APPLE_ID: "REPLACE_WITH_APPLE_ID"
+    scripts:
+      - name: Generate Xcode project (xcodegen)
+        script: |
+          set -e
+          command -v xcodegen >/dev/null 2>&1 || brew install xcodegen
+          xcodegen generate
+      - name: Set up code signing
+        script: |
+          set -e
+          # 把 Codemagic 下载的证书/描述文件写进 xcodeproj（主 App 与两个扩展）
+          xcode-project use-profiles
+      - name: Increment build number
+        script: |
+          set -e
+          if [ -z "$APP_STORE_APPLE_ID" ] || [ "$APP_STORE_APPLE_ID" = "REPLACE_WITH_APPLE_ID" ]; then
+            echo "APP_STORE_APPLE_ID not set -> keep CURRENT_PROJECT_VERSION from project.yml"
+            exit 0
+          fi
+          LATEST=$(app-store-connect get-latest-app-store-build-number "$APP_STORE_APPLE_ID")
+          echo "Latest TestFlight/App Store build: $LATEST"
+          agvtool new-version -all $((LATEST + 1))
+      - name: Build signed IPA
+        script: |
+          set -e
+          xcode-project build-ipa \
+            --project "$CM_BUILD_DIR/$XCODE_PROJECT" \
+            --scheme "$XCODE_SCHEME"
+    artifacts:
+      - build/ios/ipa/*.ipa
+      - /tmp/xcodebuild_logs/*.log
+      - $HOME/Library/Developer/Xcode/DerivedData/**/Build/**/*.dSYM
+    publishing:
+      app_store_connect:
+        auth: integration
+        # 上传后进入 TestFlight；先只给内部测试者，外部测试再手动提交 Beta Review
+        submit_to_testflight: true
+      # 需要邮件通知时取消注释并填收件人
+      # email:
+      #   recipients:
+      #     - you@example.com
+      #   notify:
+      #     success: false
+      #     failure: true
